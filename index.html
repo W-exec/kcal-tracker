@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kcal Tracker Pro ✨</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, query, where, onSnapshot, doc, deleteDoc, Timestamp, setLogLevel, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase Configuration ---
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'kcal-tracker-default';
+        
+        let app;
+        let auth;
+        let db;
+        let userId;
+        let foodLogCollectionRef; // Reference to the collection, not the query
+
+        // --- App State ---
+        let currentView = 'home'; // 'home', 'tracker', 'calendar'
+        let calendarDate = new Date(); // For calendar view
+        let weeklyChart = null;
+
+        // --- Constants ---
+        const KCAL_PER_FAT_GRAM = 9;
+        const KCAL_PER_PROTEIN_GRAM = 4;
+        const KCAL_PER_CARB_GRAM = 4;
+        const GEMINI_API_KEY = ""; 
+        const GEMINI_TEXT_MODEL = "gemini-2.0-flash";
+        const GEMINI_JSON_MODEL = "gemini-2.0-flash";
+        const MONTH_NAMES_DE = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
+        const DAY_NAMES_DE_SHORT = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+
+        // --- UI Elements ---
+        const homeScreen = document.getElementById('homeScreen');
+        const trackerScreen = document.getElementById('trackerScreen');
+        const calendarScreen = document.getElementById('calendarScreen');
+        
+        // Tracker Screen Elements
+        const dailyKcalEl = document.getElementById('dailyKcal');
+        const dailyFatEl = document.getElementById('dailyFat');
+        const dailyProteinEl = document.getElementById('dailyProtein');
+        const dailyCarbsEl = document.getElementById('dailyCarbs');
+        const foodLogListEl = document.getElementById('foodLogList');
+        const addFoodModal = document.getElementById('addFoodModal');
+        const addFoodForm = document.getElementById('addFoodForm');
+        const foodNameInput = document.getElementById('foodName');
+        const baseFatInput = document.getElementById('baseFat');
+        const baseProteinInput = document.getElementById('baseProtein');
+        const baseCarbsInput = document.getElementById('baseCarbs');
+        const quantitySlider = document.getElementById('quantitySlider');
+        const quantityDisplaySpan = document.getElementById('quantityDisplaySpan');
+        const quantityInputDiv = document.getElementById('quantityInputDiv');
+        const quantityNumberInput = document.getElementById('quantityNumberInput');
+        const quantityLabel = document.getElementById('quantityLabel');
+        const currentKcalDisplay = document.getElementById('currentKcalDisplay');
+        const currentFatDisplay = document.getElementById('currentFatDisplay');
+        const currentProteinDisplay = document.getElementById('currentProteinDisplay');
+        const currentCarbsDisplay = document.getElementById('currentCarbsDisplay');
+        const openModalButton = document.getElementById('openModalButton');
+        const closeModalButton = document.getElementById('closeModalButton');
+        const guessMacrosButton = document.getElementById('guessMacrosButton');
+        const trackerDateDisplay = document.getElementById('trackerDateDisplay');
+
+        // Calendar Screen Elements
+        const calendarMonthYearEl = document.getElementById('calendarMonthYear');
+        const calendarGridEl = document.getElementById('calendarGrid');
+        const prevMonthButton = document.getElementById('prevMonth');
+        const nextMonthButton = document.getElementById('nextMonth');
+        const calendarSelectedDateEl = document.getElementById('calendarSelectedDate');
+        const calendarFoodLogEl = document.getElementById('calendarFoodLog');
+        const calendarDailyKcalEl = document.getElementById('calendarDailyKcal');
+        const calendarDailyFatEl = document.getElementById('calendarDailyFat');
+        const calendarDailyProteinEl = document.getElementById('calendarDailyProtein');
+        const calendarDailyCarbsEl = document.getElementById('calendarDailyCarbs');
+        const weeklyChartCanvas = document.getElementById('weeklyAverageChart');
+
+
+        // Insights Modal Elements
+        const insightsModal = document.getElementById('insightsModal');
+        const insightsContentEl = document.getElementById('insightsContent');
+        const insightsFoodNameEl = document.getElementById('insightsFoodName');
+        const closeInsightsModalButton = document.getElementById('closeInsightsModalButton');
+        const insightsLoadingIndicator = document.getElementById('insightsLoadingIndicator');
+
+        // General UI
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const generalLoadingIndicator = document.getElementById('generalLoadingIndicator');
+        const userIdDisplay = document.getElementById('userIdDisplay');
+        const errorMessageEl = document.getElementById('errorMessage');
+
+        // --- Navigation ---
+        function showView(viewName) {
+            currentView = viewName;
+            homeScreen.classList.toggle('hidden', viewName !== 'home');
+            trackerScreen.classList.toggle('hidden', viewName !== 'tracker');
+            calendarScreen.classList.toggle('hidden', viewName !== 'calendar');
+
+            if (viewName === 'tracker') setupTodayTracker();
+            if (viewName === 'calendar') renderCalendar();
+        }
+
+        document.getElementById('goToTrackerButton').addEventListener('click', () => showView('tracker'));
+        document.getElementById('goToCalendarButton').addEventListener('click', () => showView('calendar'));
+        document.querySelectorAll('.backToHomeButton').forEach(btn => btn.addEventListener('click', () => showView('home')));
+
+        // --- Utility Functions ---
+        function getFormattedDateString(dateObj, format = "YYYY-MM-DD") {
+            const year = dateObj.getFullYear();
+            const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+            const day = String(dateObj.getDate()).padStart(2, '0');
+            if (format === "DD.MM.YYYY") return `${day}.${month}.${year}`;
+            return `${year}-${month}-${day}`; // Default YYYY-MM-DD
+        }
+
+        function showLoading(element, show) {
+            if (element) element.classList.toggle('hidden', !show);
+        }
+
+        function showUserMessage(message, type = 'error', duration = 3000) {
+            errorMessageEl.textContent = message;
+            errorMessageEl.classList.remove('hidden', 'bg-red-500', 'bg-green-500', 'bg-blue-500');
+            if (type === 'error') errorMessageEl.classList.add('bg-red-500');
+            else if (type === 'success') errorMessageEl.classList.add('bg-green-500');
+            else errorMessageEl.classList.add('bg-blue-500');
+            setTimeout(() => errorMessageEl.classList.add('hidden'), duration);
+        }
+        
+        // --- Modal Management (Add Food & Insights) ---
+        function openAddFoodModal() {
+            addFoodModal.classList.remove('hidden');
+            addFoodForm.reset(); 
+            quantitySlider.value = 100; 
+            quantityNumberInput.value = 100;
+            switchToQuantityDisplay();
+            updateCurrentStatsInModal(); 
+        }
+        function closeAddFoodModal() { addFoodModal.classList.add('hidden'); }
+        function openInsightsModal(foodName) {
+            insightsFoodNameEl.textContent = foodName;
+            insightsContentEl.innerHTML = ''; 
+            insightsModal.classList.remove('hidden');
+        }
+        function closeInsightsModal() { insightsModal.classList.add('hidden'); }
+
+        // --- Quantity Input Management (in Add Food Modal) ---
+        function switchToQuantityInput() {
+            quantityDisplaySpan.classList.add('hidden');
+            quantityInputDiv.classList.remove('hidden');
+            quantityNumberInput.focus();
+            quantityNumberInput.select();
+        }
+        function switchToQuantityDisplay() {
+            quantityDisplaySpan.classList.remove('hidden');
+            quantityInputDiv.classList.add('hidden');
+        }
+        function handleQuantityInputChange() {
+            let value = parseInt(quantityNumberInput.value);
+            if (isNaN(value) || value < 0) value = 0;
+            if (value > 1000) value = 1000;
+            quantityNumberInput.value = value; 
+            quantitySlider.value = value;
+            updateCurrentStatsInModal();
+        }
+        function handleQuantityInputConfirm() {
+            handleQuantityInputChange(); 
+            switchToQuantityDisplay();
+        }
+
+        // --- Dynamic Calculation for Add Food Modal ---
+        function updateCurrentStatsInModal() {
+            const baseFat = parseFloat(baseFatInput.value) || 0;
+            const baseProtein = parseFloat(baseProteinInput.value) || 0;
+            const baseCarbs = parseFloat(baseCarbsInput.value) || 0;
+            const quantity = parseFloat(quantitySlider.value) || 0;
+
+            quantityDisplaySpan.textContent = `${quantity}g`; 
+
+            const currentFat = (baseFat / 100) * quantity;
+            const currentProtein = (baseProtein / 100) * quantity;
+            const currentCarbs = (baseCarbs / 100) * quantity;
+            const currentKcal = (currentFat * KCAL_PER_FAT_GRAM) + (currentProtein * KCAL_PER_PROTEIN_GRAM) + (currentCarbs * KCAL_PER_CARB_GRAM);
+
+            currentFatDisplay.textContent = currentFat.toFixed(1);
+            currentProteinDisplay.textContent = currentProtein.toFixed(1);
+            currentCarbsDisplay.textContent = currentCarbs.toFixed(1);
+            currentKcalDisplay.textContent = currentKcal.toFixed(0);
+        }
+        
+        // --- Firestore Operations ---
+        async function addFoodEntryToDb(e) {
+            e.preventDefault();
+            if (!db || !userId) {
+                showUserMessage("Firestore nicht bereit. Bitte warten.");
+                return;
+            }
+            showLoading(loadingIndicator, true);
+            const foodName = foodNameInput.value.trim();
+            const baseFat = parseFloat(baseFatInput.value) || 0;
+            const baseProtein = parseFloat(baseProteinInput.value) || 0;
+            const baseCarbs = parseFloat(baseCarbsInput.value) || 0;
+            const quantityGrams = parseFloat(quantitySlider.value) || 0;
+
+            if (!foodName) {
+                showUserMessage("Bitte einen Lebensmittelnamen eingeben.");
+                showLoading(loadingIndicator, false);
+                return;
+            }
+            
+            const totalFat = (baseFat / 100) * quantityGrams;
+            const totalProtein = (baseProtein / 100) * quantityGrams;
+            const totalCarbs = (baseCarbs / 100) * quantityGrams;
+            const totalKcal = (totalFat * KCAL_PER_FAT_GRAM) + (totalProtein * KCAL_PER_PROTEIN_GRAM) + (totalCarbs * KCAL_PER_CARB_GRAM);
+
+            try {
+                await addDoc(foodLogCollectionRef, {
+                    name: foodName,
+                    baseFatPer100g: baseFat,
+                    baseProteinPer100g: baseProtein,
+                    baseCarbsPer100g: baseCarbs,
+                    quantityGrams: quantityGrams,
+                    totalFat: totalFat,
+                    totalProtein: totalProtein,
+                    totalCarbs: totalCarbs,
+                    totalKcal: totalKcal,
+                    entryDate: getFormattedDateString(new Date()), // For today's tracker
+                    createdAt: Timestamp.now() 
+                });
+                closeAddFoodModal();
+            } catch (error) {
+                console.error("Error adding food entry: ", error);
+                showUserMessage('Fehler beim Hinzufügen. Bitte erneut versuchen.');
+            } finally {
+                showLoading(loadingIndicator, false);
+            }
+        }
+
+        async function deleteFoodEntryFromDb(entryId, dateString) {
+            if (!db || !userId || !entryId) {
+                showUserMessage("Löschen nicht möglich.");
+                return;
+            }
+            showLoading(loadingIndicator, true);
+            try {
+                const entryDocRef = doc(db, `/artifacts/${appId}/users/${userId}/kcalLog`, entryId);
+                await deleteDoc(entryDocRef);
+                // After deleting, refresh the view (either tracker or calendar)
+                if (currentView === 'tracker') setupTodayTracker();
+                if (currentView === 'calendar') fetchAndDisplayDataForDate(new Date(dateString.replace(/-/g, '/'))); // Ensure correct date parsing
+            } catch (error) {
+                console.error("Error deleting food entry: ", error);
+                showUserMessage('Fehler beim Löschen.');
+            } finally {
+                showLoading(loadingIndicator, false);
+            }
+        }
+        
+        async function fetchFoodEntriesForDate(dateObj) {
+            if (!foodLogCollectionRef) return [];
+            const dateStr = getFormattedDateString(dateObj);
+            const q = query(foodLogCollectionRef, where("entryDate", "==", dateStr));
+            const querySnapshot = await getDocs(q);
+            const entries = [];
+            querySnapshot.forEach((doc) => {
+                entries.push({ id: doc.id, ...doc.data() });
+            });
+            return entries.sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
+        }
+
+
+        // --- Gemini API Calls ---
+        async function handleGuessMacros() {
+            const foodName = foodNameInput.value.trim();
+            if (!foodName) {
+                showUserMessage("Bitte zuerst einen Lebensmittelnamen eingeben.");
+                return;
+            }
+            showLoading(generalLoadingIndicator, true);
+            guessMacrosButton.disabled = true;
+            const prompt = `Provide typical macronutrient values (fat, protein, carbohydrates) in grams per 100g for the food item: "${foodName}". Return the result as a JSON object with keys "fat", "protein", and "carbs". If you cannot determine the macros, return null for the values. Example: {"fat": 10.1, "protein": 20.2, "carbs": 5.5}`;
+            const payload = {
+                contents: [{ role: "user", parts: [{ text: prompt }] }],
+                generationConfig: { responseMimeType: "application/json", responseSchema: { type: "OBJECT", properties: { fat: { type: "NUMBER" }, protein: { type: "NUMBER" }, carbs: { type: "NUMBER" }}, required: ["fat", "protein", "carbs"]}}
+            };
+            try {
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_JSON_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+                const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if (!response.ok) { const err = await response.json(); throw new Error(`API Error (${response.status}): ${err?.error?.message}`); }
+                const result = await response.json();
+                if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
+                    const macros = JSON.parse(result.candidates[0].content.parts[0].text);
+                    if (macros && typeof macros.fat === 'number') {
+                        baseFatInput.value = parseFloat(macros.fat).toFixed(1);
+                        baseProteinInput.value = parseFloat(macros.protein).toFixed(1);
+                        baseCarbsInput.value = parseFloat(macros.carbs).toFixed(1);
+                        updateCurrentStatsInModal();
+                        showUserMessage('Makros erfolgreich geschätzt! Bitte überprüfen.', 'success');
+                    } else { showUserMessage('Makros konnten nicht geschätzt werden.'); }
+                } else { throw new Error("Unexpected API response."); }
+            } catch (error) { console.error("Error guessing macros:", error); showUserMessage(`Fehler: ${error.message}`);
+            } finally { showLoading(generalLoadingIndicator, false); guessMacrosButton.disabled = false; }
+        }
+
+        async function handleGetNutritionalInsights(foodName) {
+            if (!foodName) return;
+            openInsightsModal(foodName);
+            showLoading(insightsLoadingIndicator, true);
+            const prompt = `Provide 2-3 brief, interesting nutritional insights or healthy tips in German about "${foodName}". Focus on common knowledge. Keep it concise.`;
+            const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
+            try {
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+                const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if (!response.ok) { const err = await response.json(); throw new Error(`API Error (${response.status}): ${err?.error?.message}`); }
+                const result = await response.json();
+                if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
+                    insightsContentEl.innerHTML = result.candidates[0].content.parts[0].text.replace(/\n/g, '<br>');
+                } else { insightsContentEl.textContent = "Keine Einblicke verfügbar."; }
+            } catch (error) { console.error("Error getting insights:", error); insightsContentEl.textContent = `Fehler: ${error.message}`;
+            } finally { showLoading(insightsLoadingIndicator, false); }
+        }
+
+        // --- UI Rendering (Food Log for Tracker & Calendar) ---
+        function renderFoodLogToElement(element, entries, dateStringForDelete) {
+            element.innerHTML = ''; 
+            if (entries.length === 0) {
+                element.innerHTML = `<li class="text-gray-500 italic p-3">Keine Einträge für diesen Tag.</li>`;
+                return;
+            }
+            entries.forEach(entry => {
+                const li = document.createElement('li');
+                li.className = 'p-3 bg-white border border-gray-200 rounded-lg shadow-sm flex flex-col sm:flex-row justify-between items-start sm:items-center mb-2';
+                li.innerHTML = `
+                    <div>
+                        <h3 class="font-semibold text-md text-indigo-600">${entry.name} (${entry.quantityGrams}g)</h3>
+                        <p class="text-xs text-gray-500">
+                            Kcal: ${entry.totalKcal.toFixed(0)} | Fett: ${entry.totalFat.toFixed(1)}g | Protein: ${entry.totalProtein.toFixed(1)}g | KH: ${entry.totalCarbs.toFixed(1)}g
+                        </p>
+                    </div>
+                    <div class="flex items-center space-x-1 mt-2 sm:mt-0">
+                        <button data-foodname="${entry.name}" class="insights-btn text-blue-500 hover:text-blue-700 text-xs p-1 rounded-md hover:bg-blue-50 flex items-center">✨ Einblicke</button>
+                        <button data-id="${entry.id}" data-date="${dateStringForDelete}" class="delete-btn text-red-500 hover:text-red-700 text-xs p-1 rounded-md hover:bg-red-50 flex items-center">🗑️ Löschen</button>
+                    </div>`;
+                element.appendChild(li);
+            });
+            element.querySelectorAll('.delete-btn').forEach(button => button.addEventListener('click', (e) => {
+                const target = e.target.closest('.delete-btn');
+                deleteFoodEntryFromDb(target.dataset.id, target.dataset.date);
+            }));
+            element.querySelectorAll('.insights-btn').forEach(button => button.addEventListener('click', (e) => {
+                 const target = e.target.closest('.insights-btn');
+                handleGetNutritionalInsights(target.dataset.foodname);
+            }));
+        }
+
+        function updateDailyTotalsUI(elementSet, entries) {
+            let totalKcal = 0, totalFat = 0, totalProtein = 0, totalCarbs = 0;
+            entries.forEach(entry => {
+                totalKcal += entry.totalKcal; totalFat += entry.totalFat; totalProtein += entry.totalProtein; totalCarbs += entry.totalCarbs;
+            });
+            elementSet.kcal.textContent = totalKcal.toFixed(0);
+            elementSet.fat.textContent = totalFat.toFixed(1);
+            elementSet.protein.textContent = totalProtein.toFixed(1);
+            elementSet.carbs.textContent = totalCarbs.toFixed(1);
+        }
+        
+        // --- Kcal Tracker Screen Specific Logic ---
+        let unsubscribeTrackerSnaphot = null;
+        function setupTodayTracker() {
+            if (!foodLogCollectionRef) return;
+            trackerDateDisplay.textContent = `Heute, ${getFormattedDateString(new Date(), "DD.MM.YYYY")}`;
+            const todayStr = getFormattedDateString(new Date());
+            const q = query(foodLogCollectionRef, where("entryDate", "==", todayStr));
+
+            if (unsubscribeTrackerSnaphot) unsubscribeTrackerSnaphot(); // Unsubscribe from previous listener
+
+            unsubscribeTrackerSnaphot = onSnapshot(q, (querySnapshot) => {
+                const entries = [];
+                querySnapshot.forEach((doc) => entries.push({ id: doc.id, ...doc.data() }));
+                entries.sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
+                renderFoodLogToElement(foodLogListEl, entries, todayStr);
+                updateDailyTotalsUI({ kcal: dailyKcalEl, fat: dailyFatEl, protein: dailyProteinEl, carbs: dailyCarbsEl }, entries);
+            }, (error) => {
+                console.error("Error listening to today's food log: ", error);
+                showUserMessage('Fehler beim Laden der heutigen Einträge.');
+            });
+        }
+
+        // --- Calendar Screen Specific Logic ---
+        function renderCalendar() {
+            calendarGridEl.innerHTML = '';
+            calendarMonthYearEl.textContent = `${MONTH_NAMES_DE[calendarDate.getMonth()]} ${calendarDate.getFullYear()}`;
+            const currentMonth = calendarDate.getMonth();
+            const currentYear = calendarDate.getFullYear();
+            const firstDayOfMonth = new Date(currentYear, currentMonth, 1).getDay(); // 0=Sunday, 1=Monday...
+            const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+
+            // Day headers (Mo, Di, etc.)
+            DAY_NAMES_DE_SHORT.forEach(dayName => {
+                 const dayHeaderEl = document.createElement('div');
+                 dayHeaderEl.className = 'text-center font-medium text-xs text-gray-500';
+                 dayHeaderEl.textContent = dayName;
+                 calendarGridEl.appendChild(dayHeaderEl);
+            });
+
+            for (let i = 0; i < (firstDayOfMonth === 0 ? 6 : firstDayOfMonth -1) ; i++) { // Adjust for Monday start
+                calendarGridEl.appendChild(document.createElement('div')); // Empty cells for offset
+            }
+
+            for (let day = 1; day <= daysInMonth; day++) {
+                const dayEl = document.createElement('button');
+                dayEl.className = 'text-center p-2 rounded-md hover:bg-indigo-100 focus:outline-none focus:ring-2 focus:ring-indigo-300 transition-colors';
+                dayEl.textContent = day;
+                const dateForDay = new Date(currentYear, currentMonth, day);
+                const dateStr = getFormattedDateString(dateForDay);
+
+                if (dateStr === getFormattedDateString(new Date())) { // Today
+                    dayEl.classList.add('bg-indigo-500', 'text-white', 'font-semibold');
+                }
+                if (dateStr === getFormattedDateString(calendarDate)) { // Selected day
+                     dayEl.classList.add('ring-2', 'ring-indigo-500', 'bg-indigo-200');
+                }
+                
+                dayEl.onclick = () => {
+                    calendarDate = dateForDay; // Update selected date for calendar
+                    fetchAndDisplayDataForDate(dateForDay);
+                    renderCalendar(); // Re-render to highlight selected day
+                };
+                calendarGridEl.appendChild(dayEl);
+            }
+            fetchAndDisplayDataForDate(calendarDate); // Initial load for current month's selected date
+        }
+
+        async function fetchAndDisplayDataForDate(dateObj) {
+            calendarSelectedDateEl.textContent = getFormattedDateString(dateObj, "DD.MM.YYYY");
+            showLoading(loadingIndicator, true);
+            const entries = await fetchFoodEntriesForDate(dateObj);
+            renderFoodLogToElement(calendarFoodLogEl, entries, getFormattedDateString(dateObj));
+            updateDailyTotalsUI({ kcal: calendarDailyKcalEl, fat: calendarDailyFatEl, protein: calendarDailyProteinEl, carbs: calendarDailyCarbsEl }, entries);
+            await updateWeeklyAverageChart(dateObj);
+            showLoading(loadingIndicator, false);
+        }
+        
+        prevMonthButton.addEventListener('click', () => {
+            calendarDate.setMonth(calendarDate.getMonth() - 1);
+            renderCalendar();
+        });
+        nextMonthButton.addEventListener('click', () => {
+            calendarDate.setMonth(calendarDate.getMonth() + 1);
+            renderCalendar();
+        });
+
+        // --- Weekly Average Chart ---
+        async function updateWeeklyAverageChart(endDateObj) {
+            showLoading(generalLoadingIndicator, true);
+            const weeklyData = { dates: [], kcals: [], fats: [], proteins: [], carbs: [] };
+            let totalKcalWeek = 0, totalFatWeek = 0, totalProteinWeek = 0, totalCarbsWeek = 0;
+            let daysWithEntries = 0;
+
+            for (let i = 0; i < 7; i++) {
+                const dayDate = new Date(endDateObj);
+                dayDate.setDate(endDateObj.getDate() - i);
+                const entries = await fetchFoodEntriesForDate(dayDate);
+                
+                if (entries.length > 0) {
+                    daysWithEntries++;
+                    entries.forEach(e => {
+                        totalKcalWeek += e.totalKcal;
+                        totalFatWeek += e.totalFat;
+                        totalProteinWeek += e.totalProtein;
+                        totalCarbsWeek += e.totalCarbs;
+                    });
+                }
+            }
+
+            const avgKcal = daysWithEntries > 0 ? totalKcalWeek / daysWithEntries : 0;
+            const avgFat = daysWithEntries > 0 ? totalFatWeek / daysWithEntries : 0;
+            const avgProtein = daysWithEntries > 0 ? totalProteinWeek / daysWithEntries : 0;
+            const avgCarbs = daysWithEntries > 0 ? totalCarbsWeek / daysWithEntries : 0;
+
+            // For simplicity, chart shows one bar for "Average Last 7 Days"
+            const chartLabels = ['Durchschnitt letzte 7 Tage'];
+            const chartData = {
+                labels: chartLabels,
+                datasets: [
+                    { label: 'Kcal', data: [avgKcal], backgroundColor: 'rgba(79, 70, 229, 0.7)', borderColor: 'rgba(79, 70, 229, 1)', borderWidth: 1 },
+                    { label: 'Fett (g)', data: [avgFat], backgroundColor: 'rgba(236, 72, 153, 0.7)', borderColor: 'rgba(236, 72, 153, 1)', borderWidth: 1 },
+                    { label: 'Protein (g)', data: [avgProtein], backgroundColor: 'rgba(16, 185, 129, 0.7)', borderColor: 'rgba(16, 185, 129, 1)', borderWidth: 1 },
+                    { label: 'KH (g)', data: [avgCarbs], backgroundColor: 'rgba(245, 158, 11, 0.7)', borderColor: 'rgba(245, 158, 11, 1)', borderWidth: 1 }
+                ]
+            };
+
+            if (weeklyChart) weeklyChart.destroy();
+            weeklyChart = new Chart(weeklyChartCanvas, {
+                type: 'bar', data: chartData,
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { title: { display: true, text: `Wochendurchschnitt (Ende: ${getFormattedDateString(endDateObj, "DD.MM.YYYY")})`, font: {size: 16}}},
+                    scales: { y: { beginAtZero: true, title: {display: true, text: 'Menge'} } }
+                }
+            });
+            showLoading(generalLoadingIndicator, false);
+        }
+
+
+        // --- Initialization ---
+        async function initializeAppAndAuth() {
+            if (Object.keys(firebaseConfig).length === 0) {
+                showUserMessage('App-Konfigurationsfehler.'); showLoading(loadingIndicator, false); return;
+            }
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('debug'); 
+                showLoading(loadingIndicator, true);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        if (userIdDisplay) userIdDisplay.textContent = `User ID: ${userId}`;
+                        foodLogCollectionRef = collection(db, `/artifacts/${appId}/users/${userId}/kcalLog`);
+                        showView('home'); // Start at home screen
+                    } else {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            try { await signInWithCustomToken(auth, __initial_auth_token); } 
+                            catch (error) { await signInAnonymously(auth); }
+                        } else { await signInAnonymously(auth); }
+                    }
+                    showLoading(loadingIndicator, false); // General loading false after auth attempt
+                });
+            } catch (error) {
+                console.error("Firebase init error:", error);
+                showUserMessage('Kritischer App-Initialisierungsfehler.');
+                showLoading(loadingIndicator, false);
+            }
+        }
+
+        // --- Global Event Listeners ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeAppAndAuth();
+            openModalButton.addEventListener('click', openAddFoodModal);
+            closeModalButton.addEventListener('click', closeAddFoodModal);
+            addFoodForm.addEventListener('submit', addFoodEntryToDb);
+            guessMacrosButton.addEventListener('click', handleGuessMacros);
+            closeInsightsModalButton.addEventListener('click', closeInsightsModal);
+            insightsModal.addEventListener('click', (e) => { if (e.target === insightsModal) closeInsightsModal(); });
+            addFoodModal.addEventListener('click', (e) => { if (e.target === addFoodModal) closeAddFoodModal(); });
+            [baseFatInput, baseProteinInput, baseCarbsInput, quantitySlider].forEach(el => el.addEventListener('input', updateCurrentStatsInModal));
+            quantityLabel.addEventListener('click', switchToQuantityInput);
+            quantityNumberInput.addEventListener('blur', handleQuantityInputConfirm);
+            quantityNumberInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); handleQuantityInputConfirm(); }});
+            quantitySlider.addEventListener('input', () => { quantityNumberInput.value = quantitySlider.value; updateCurrentStatsInModal(); });
+        });
+    </script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .modal-content { max-height: 90vh; }
+        .gemini-button { background-color: #EDE7F6; color: #5E35B1; border: 1px solid #D1C4E9; }
+        .gemini-button:hover { background-color: #D1C4E9; }
+        #generalLoadingIndicator { background-color: rgba(0, 0, 0, 0.1); }
+        #quantityLabel:hover { cursor: pointer; background-color: #f0f0f0; }
+        .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+        #weeklyAverageChartContainer { height: 300px; position: relative; } /* Ensure chart has space */
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex flex-col items-center p-4 md:p-8">
+
+    <div id="loadingIndicator" class="hidden fixed inset-0 bg-gray-800 bg-opacity-50 flex items-center justify-center z-[60]">
+        <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-indigo-500"></div>
+    </div>
+    <div id="generalLoadingIndicator" class="hidden fixed inset-0 flex items-center justify-center z-[55]">
+        <div class="animate-spin rounded-full h-12 w-12 border-t-4 border-b-4 border-purple-500"></div>
+        <p class="ml-3 text-purple-600 font-semibold">✨ Verarbeite...</p>
+    </div>
+    <div id="errorMessage" class="hidden fixed top-5 right-5 text-white p-3 rounded-lg shadow-md z-[70] text-sm"></div>
+
+    <div id="homeScreen" class="w-full max-w-2xl text-center">
+        <header class="mb-12">
+            <h1 class="text-5xl font-bold text-indigo-600">Kcal Tracker Pro ✨</h1>
+            <p class="text-lg text-gray-600 mt-2">Dein täglicher Begleiter für Ernährung.</p>
+            <p id="userIdDisplay" class="text-xs text-gray-400 mt-1"></p>
+        </header>
+        <nav class="space-y-6">
+            <button id="goToTrackerButton" class="w-full max-w-md mx-auto bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-4 px-8 rounded-xl shadow-lg hover:shadow-xl transition-all duration-150 ease-in-out transform hover:scale-105 text-lg flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mr-3"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg>
+                Heutigen Tag tracken
+            </button>
+            <button id="goToCalendarButton" class="w-full max-w-md mx-auto bg-purple-600 hover:bg-purple-700 text-white font-semibold py-4 px-8 rounded-xl shadow-lg hover:shadow-xl transition-all duration-150 ease-in-out transform hover:scale-105 text-lg flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mr-3"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+                Kalender & Verlauf
+            </button>
+        </nav>
+    </div>
+
+    <div id="trackerScreen" class="hidden w-full max-w-2xl bg-white shadow-xl rounded-xl p-6 md:p-8">
+        <header class="mb-8 flex justify-between items-center">
+            <div>
+                <h1 class="text-3xl font-bold text-indigo-600">Tagesansicht</h1>
+                <p id="trackerDateDisplay" class="text-gray-500"></p>
+            </div>
+            <button class="backToHomeButton text-sm text-indigo-600 hover:underline">🏠 Zurück zum Start</button>
+        </header>
+        <section id="dailyTotals" class="mb-8 p-6 bg-indigo-50 rounded-lg shadow">
+            <h2 class="text-xl font-semibold text-indigo-700 mb-4">Heutige Zusammenfassung</h2>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-center">
+                <div><p class="text-xs text-gray-500">KCAL</p><p id="dailyKcal" class="text-2xl font-bold text-indigo-600">0</p></div>
+                <div><p class="text-xs text-gray-500">FETT (g)</p><p id="dailyFat" class="text-2xl font-bold text-pink-500">0.0</p></div>
+                <div><p class="text-xs text-gray-500">PROTEIN (g)</p><p id="dailyProtein" class="text-2xl font-bold text-green-500">0.0</p></div>
+                <div><p class="text-xs text-gray-500">KH (g)</p><p id="dailyCarbs" class="text-2xl font-bold text-yellow-500">0.0</p></div>
+            </div>
+        </section>
+        <div class="mb-6 text-center">
+            <button id="openModalButton" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:shadow-lg transition-all flex items-center justify-center mx-auto">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mr-2"><line x1="12" y1="5" y2="19"></line><line x1="5" y1="12" y2="19"></line></svg>
+                Lebensmittel hinzufügen
+            </button>
+        </div>
+        <section id="foodLog">
+            <h2 class="text-xl font-semibold text-indigo-700 mb-4">Heute protokolliert</h2>
+            <ul id="foodLogList" class="space-y-2"></ul>
+        </section>
+    </div>
+
+    <div id="calendarScreen" class="hidden w-full max-w-3xl bg-white shadow-xl rounded-xl p-6 md:p-8">
+        <header class="mb-8 flex justify-between items-center">
+            <h1 class="text-3xl font-bold text-indigo-600">Kalender & Verlauf</h1>
+            <button class="backToHomeButton text-sm text-indigo-600 hover:underline">🏠 Zurück zum Start</button>
+        </header>
+        
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div class="lg:col-span-1 space-y-4">
+                <div class="p-4 border rounded-lg bg-gray-50">
+                    <div class="flex justify-between items-center mb-3">
+                        <button id="prevMonth" class="p-2 rounded-md hover:bg-gray-200">&lt;</button>
+                        <h2 id="calendarMonthYear" class="text-lg font-semibold text-indigo-700"></h2>
+                        <button id="nextMonth" class="p-2 rounded-md hover:bg-gray-200">&gt;</button>
+                    </div>
+                    <div id="calendarGrid" class="calendar-grid"></div>
+                </div>
+                <div id="weeklyAverageChartContainer" class="p-4 border rounded-lg bg-gray-50">
+                     <canvas id="weeklyAverageChart"></canvas>
+                </div>
+            </div>
+
+            <div class="lg:col-span-2 space-y-4">
+                 <div class="p-4 border rounded-lg bg-indigo-50 shadow">
+                    <h3 class="text-lg font-semibold text-indigo-700 mb-2">Zusammenfassung für: <span id="calendarSelectedDate" class="text-purple-600"></span></h3>
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
+                        <div><p class="text-xs text-gray-500">KCAL</p><p id="calendarDailyKcal" class="text-xl font-bold text-indigo-600">0</p></div>
+                        <div><p class="text-xs text-gray-500">FETT (g)</p><p id="calendarDailyFat" class="text-xl font-bold text-pink-500">0.0</p></div>
+                        <div><p class="text-xs text-gray-500">PROTEIN (g)</p><p id="calendarDailyProtein" class="text-xl font-bold text-green-500">0.0</p></div>
+                        <div><p class="text-xs text-gray-500">KH (g)</p><p id="calendarDailyCarbs" class="text-xl font-bold text-yellow-500">0.0</p></div>
+                    </div>
+                </div>
+                <div>
+                    <h3 class="text-lg font-semibold text-indigo-700 mb-2">Protokollierte Lebensmittel:</h3>
+                    <ul id="calendarFoodLog" class="space-y-2 max-h-96 overflow-y-auto pr-2"></ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="addFoodModal" class="hidden fixed inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-center p-4 z-40">
+        <div class="bg-white p-6 md:p-8 rounded-xl shadow-2xl w-full max-w-lg modal-content overflow-y-auto">
+            <h2 class="text-2xl font-bold text-indigo-600 mb-6">Neues Lebensmittel hinzufügen</h2>
+            <form id="addFoodForm">
+                <div class="mb-4">
+                    <label for="foodName" class="block text-sm font-medium text-gray-700 mb-1">Name</label>
+                    <input type="text" id="foodName" required class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <div class="mb-4">
+                     <button type="button" id="guessMacrosButton" class="w-full gemini-button font-medium py-2 px-4 rounded-md shadow-sm hover:shadow-md flex items-center justify-center text-sm">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles mr-2"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>
+                        ✨ Makros schätzen (pro 100g)
+                    </button>
+                </div>
+                <p class="text-sm text-gray-600 mb-1">Makronährstoffe (pro 100g):</p>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                    <div><label for="baseFat" class="block text-sm font-medium text-gray-700">Fett (g)</label><input type="number" id="baseFat" step="0.1" min="0" placeholder="z.B. 10.5" required class="w-full px-3 py-2 border rounded-md shadow-sm"></div>
+                    <div><label for="baseProtein" class="block text-sm font-medium text-gray-700">Protein (g)</label><input type="number" id="baseProtein" step="0.1" min="0" placeholder="z.B. 20.0" required class="w-full px-3 py-2 border rounded-md shadow-sm"></div>
+                    <div><label for="baseCarbs" class="block text-sm font-medium text-gray-700">KH (g)</label><input type="number" id="baseCarbs" step="0.1" min="0" placeholder="z.B. 5.2" required class="w-full px-3 py-2 border rounded-md shadow-sm"></div>
+                </div>
+                <div class="mb-6">
+                    <label id="quantityLabel" class="block text-sm font-medium text-gray-700 mb-1 p-1 rounded-md hover:bg-gray-100 cursor-pointer">Menge: <span id="quantityDisplaySpan" class="font-semibold text-indigo-600">100g</span><div id="quantityInputDiv" class="hidden inline-block ml-2"><input type="number" id="quantityNumberInput" min="0" max="1000" step="1" class="w-20 px-2 py-1 border rounded-md shadow-sm text-sm"><span class="text-sm text-gray-500">g</span></div></label>
+                    <input type="range" id="quantitySlider" min="0" max="1000" value="100" step="10" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600">
+                </div>
+                <div class="mb-6 p-4 bg-indigo-50 rounded-md"><h3 class="text-md font-semibold text-indigo-700 mb-2">Für ausgewählte Menge:</h3><div class="grid grid-cols-2 gap-2 text-sm"><p>Kcal: <span id="currentKcalDisplay" class="font-bold">0</span></p><p>Fett: <span id="currentFatDisplay" class="font-bold">0.0</span>g</p><p>Protein: <span id="currentProteinDisplay" class="font-bold">0.0</span>g</p><p>KH: <span id="currentCarbsDisplay" class="font-bold">0.0</span>g</p></div></div>
+                <div class="flex justify-end space-x-3"><button type="button" id="closeModalButton" class="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-md border">Abbrechen</button><button type="submit" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-md shadow-sm">Hinzufügen</button></div>
+            </form>
+        </div>
+    </div>
+
+    <div id="insightsModal" class="hidden fixed inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div class="bg-white p-6 md:p-8 rounded-xl shadow-2xl w-full max-w-md modal-content overflow-y-auto">
+            <div class="flex justify-between items-center mb-4"><h2 class="text-xl font-bold text-indigo-600">✨ Einblicke für <span id="insightsFoodName" class="text-purple-600"></span></h2><button id="closeInsightsModalButton" class="text-gray-400 hover:text-gray-600"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button></div>
+            <div id="insightsLoadingIndicator" class="hidden flex items-center justify-center py-8"><div class="animate-spin rounded-full h-10 w-10 border-t-2 border-b-2 border-purple-500"></div><p class="ml-3 text-purple-600">Lade Einblicke...</p></div>
+            <div id="insightsContent" class="text-gray-700 text-sm space-y-2"></div>
+        </div>
+    </div>
+</body>
+</html>
